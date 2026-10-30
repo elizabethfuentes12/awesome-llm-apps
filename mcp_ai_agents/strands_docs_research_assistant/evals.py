@@ -1,4 +1,4 @@
-"""Evaluate the research assistant with Strands Evals.
+"""Evaluate the docs research assistant with Strands Evals.
 
 Three checks on every case:
 - routing:      did the harness agent call the right specialists? (deterministic, read from the traces)
@@ -6,10 +6,12 @@ Three checks on every case:
 - quality:      does the answer meet a rubric? (LLM judge)
 
 Run it with `python evals.py --model openai/gpt-5.4-mini`.
+`python evals.py --offline` runs only the wiring checks: no network, no API keys.
 
 SPDX-License-Identifier: Apache-2.0
 """
 import argparse
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -22,9 +24,7 @@ from strands_evals.types.evaluation import EvaluationData, EvaluationOutput
 from strands_evals.types.trace import ToolExecutionSpan
 from strands_harness.models import resolve_model
 
-from research_assistant import DEFAULT_MODELS, build_assistant
-
-SPECIALISTS = {"aws_specialist", "strands_specialist"}
+from strands_docs_research_assistant import DEFAULT_MODELS, SKILLS_DIR, SPECIALIST_NAMES, build_assistant
 
 CASES = [
     Case[str, str](
@@ -39,6 +39,12 @@ CASES = [
         expected_trajectory=["strands_specialist"],
         expected_output="Decorate a Python function with @tool, give it type hints and a docstring, and pass it in tools=[...] to the Agent.",
         metadata={"rubric": "Pass if it names the @tool decorator and shows how to pass the tool to an Agent."},
+    ),
+    Case[str, str](
+        name="mcp-concept",
+        input="What is the difference between MCP tools and MCP resources?",
+        expected_trajectory=["mcp_specialist"],
+        metadata={"rubric": "Pass if it explains both concepts, says who controls each, and cites a modelcontextprotocol.io URL."},
     ),
     Case[str, str](
         name="mixed",
@@ -64,7 +70,7 @@ class RoutingEvaluator(Evaluator[str, str]):
             span.tool_call.name
             for trace in getattr(session, "traces", [])
             for span in trace.spans
-            if isinstance(span, ToolExecutionSpan) and span.tool_call.name in SPECIALISTS
+            if isinstance(span, ToolExecutionSpan) and span.tool_call.name in SPECIALIST_NAMES
         }
         expected = set(evaluation_case.expected_trajectory or [])
         ok = called == expected
@@ -119,10 +125,45 @@ class RubricEvaluator(OutputEvaluator):
         return await super().evaluate_async(evaluation_case)
 
 
+# Built-in harness tools that must stay off: the answers have to come from the specialists.
+FORBIDDEN_TOOLS = {"shell", "read", "write", "edit", "web_fetch", "web_search", "programmatic_tool_caller", "subagent"}
+
+
+def offline_checks() -> int:
+    """Wiring checks that need no network and no API key. Returns the number of problems."""
+    # Building the model object needs a key to exist; no request is made.
+    os.environ.setdefault("OPENAI_API_KEY", "offline-check")
+    problems: list[str] = []
+
+    with build_assistant(
+        DEFAULT_MODELS["OpenAI"], "offline-check", state_dir=Path(tempfile.mkdtemp()), memory=False, callback_handler=None
+    ) as assistant:
+        tools = set(assistant.agent.tool_names)
+    problems += [f"specialist tool missing: {name}" for name in sorted(SPECIALIST_NAMES - tools)]
+    if "skills" not in tools:
+        problems.append("the Agent Skills tool is not registered (is skills/ found?)")
+    problems += [f"built-in tool should be off: {name}" for name in sorted(tools & FORBIDDEN_TOOLS)]
+
+    skill = (SKILLS_DIR / "grounded-research" / "SKILL.md").read_text()
+    problems += [f"SKILL.md does not mention {name}" for name in sorted(SPECIALIST_NAMES) if name not in skill]
+
+    expected = {name for case in CASES for name in (case.expected_trajectory or [])}
+    problems += [f"eval case expects an unknown specialist: {name}" for name in sorted(expected - SPECIALIST_NAMES)]
+    problems += [f"no eval case covers {name}" for name in sorted(SPECIALIST_NAMES - expected)]
+
+    for problem in problems:
+        print(f"FAIL  {problem}")
+    print(f"offline checks: {len(problems)} problem(s); tools registered: {sorted(tools)}")
+    return len(problems)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--model", default=DEFAULT_MODELS["OpenAI"], help="provider/name, also used as the judge")
+    parser.add_argument("--offline", action="store_true", help="only run the wiring checks (no network, no API keys)")
     args = parser.parse_args()
+    if args.offline:
+        return 1 if offline_checks() else 0
 
     judge = resolve_model(args.model, default=DEFAULT_MODELS["Amazon Bedrock"], effort="off")
     telemetry = StrandsEvalsTelemetry().setup_in_memory_exporter()

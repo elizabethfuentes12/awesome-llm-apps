@@ -1,5 +1,7 @@
 streamlit>=1.28.0
-strands-harness>=0.3.3
+# strands-harness is pre-1.0 and this example uses strands_harness.models.resolve_model,
+# so stay on the minor version it was tested with.
+strands-harness>=0.3.3,<0.4
 strands-agents[openai]>=1.62.0
 strands-agents-evals>=1.8.0
 # strands-agents allows mcp<2.2, so pip would pick 2.1.1, which has a published advisory
